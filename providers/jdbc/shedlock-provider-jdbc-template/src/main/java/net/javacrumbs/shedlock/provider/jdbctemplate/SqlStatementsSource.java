@@ -88,7 +88,7 @@ class SqlStatementsSource {
         try {
             return configuration.getJdbcTemplate().execute((ConnectionCallback<String>) connection -> connection.getMetaData().getDatabaseProductName());
         } catch (Exception e) {
-            logger.debug("Can not determine database product name " + e.getMessage());
+            logger.debug("Can not determine database product name {}", e.getMessage());
             return "Unknown";
         }
     }
