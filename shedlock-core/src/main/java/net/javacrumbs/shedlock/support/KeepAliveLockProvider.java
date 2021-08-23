@@ -1,14 +1,15 @@
 package net.javacrumbs.shedlock.support;
 
+import net.javacrumbs.shedlock.core.AbstractSimpleLock;
 import net.javacrumbs.shedlock.core.ExtensibleLockProvider;
 import net.javacrumbs.shedlock.core.LockConfiguration;
+import net.javacrumbs.shedlock.core.LockProvider;
 import net.javacrumbs.shedlock.core.SimpleLock;
 import net.javacrumbs.shedlock.support.annotation.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -22,7 +23,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
  *
  * Wraps ExtensibleLockProvider that implements the actual locking.
  */
-public class KeepAliveLockProvider implements ExtensibleLockProvider {
+public class KeepAliveLockProvider implements LockProvider {
     private final ExtensibleLockProvider wrapped;
     private final ScheduledExecutorService executorService;
 
@@ -37,96 +38,68 @@ public class KeepAliveLockProvider implements ExtensibleLockProvider {
     @NonNull
     public Optional<SimpleLock> lock(@NonNull LockConfiguration lockConfiguration) {
         Optional<SimpleLock> lock = wrapped.lock(lockConfiguration);
-        if (lock.isPresent()) {
-            LockExtender lockExtender = new LockExtender(lockConfiguration, lock.get());
-            long extensionPeriodMs = lockExtender.getLockExtensionPeriod().toMillis();
-            ScheduledFuture<?> future = executorService.scheduleAtFixedRate(
-                lockExtender,
+        return lock.map(simpleLock -> new KeepAliveLock(lockConfiguration, simpleLock, executorService));
+    }
+
+    private static class KeepAliveLock extends AbstractSimpleLock {
+        private final Duration lockExtensionPeriod;
+        private SimpleLock lock;
+        private Duration remainingLockAtLeastFor;
+        private final ScheduledFuture<?> future;
+        private boolean unlocked = false;
+
+        private KeepAliveLock(LockConfiguration lockConfiguration, SimpleLock lock, ScheduledExecutorService executorService) {
+            super(lockConfiguration);
+            this.lock = lock;
+            this.lockExtensionPeriod = lockConfiguration.getLockAtMostFor().dividedBy(2);
+            this.remainingLockAtLeastFor = lockConfiguration.getLockAtLeastFor();
+
+            long extensionPeriodMs = lockExtensionPeriod.toMillis();
+            this.future = executorService.scheduleAtFixedRate(
+                this::extendForNextPeriod,
                 extensionPeriodMs,
                 extensionPeriodMs,
                 MILLISECONDS
             );
-            lockExtender.setFuture(future);
-            return Optional.of(new SimpleLockWrapper(lockExtender, future));
-        } else {
-            return lock;
-        }
-    }
-
-    private static class LockExtender implements Runnable {
-        private final LockConfiguration lockConfiguration;
-        private final Duration lockExtensionPeriod;
-        private SimpleLock lock;
-        private Duration remainingLockAtLeastFor;
-        private ScheduledFuture<?> future;
-
-        private LockExtender(LockConfiguration lockConfiguration, SimpleLock lock) {
-            this.lockConfiguration = lockConfiguration;
-            this.lock = lock;
-            this.lockExtensionPeriod = lockConfiguration.getLockAtMostFor().dividedBy(2);
-            this.remainingLockAtLeastFor = lockConfiguration.getLockAtLeastFor();
         }
 
-        @Override
-        public void run() {
-            remainingLockAtLeastFor = remainingLockAtLeastFor.minus(lockExtensionPeriod);
-            if (remainingLockAtLeastFor.isNegative()) {
-                remainingLockAtLeastFor = Duration.ZERO;
-            }
-            Optional<SimpleLock> extendedLock = lock.extend(lockConfiguration.getLockAtMostFor(), remainingLockAtLeastFor);
-            if (extendedLock.isPresent()) {
-                logger.debug("Lock {} extended for {}", lockConfiguration.getName(), lockConfiguration.getLockAtMostFor());
-                lock = extendedLock.get();
-            } else {
-                logger.warn("Can't extend lock {}", lockConfiguration.getName());
-                if (future != null) {
-                    future.cancel(false);
+        private void extendForNextPeriod() {
+            // We can have a race-condition when we extend the lock but the `lock` field is accessed before we update it.
+            synchronized (this) {
+                if (unlocked) {
+                    return;
+                }
+                remainingLockAtLeastFor = remainingLockAtLeastFor.minus(lockExtensionPeriod);
+                if (remainingLockAtLeastFor.isNegative()) {
+                    remainingLockAtLeastFor = Duration.ZERO;
+                }
+                Optional<SimpleLock> extendedLock = lock.extend(lockConfiguration.getLockAtMostFor(), remainingLockAtLeastFor);
+                if (extendedLock.isPresent()) {
+                    lock = extendedLock.get();
+                    logger.trace("Lock {} extended for {}", lockConfiguration.getName(), lockConfiguration.getLockAtMostFor());
+                } else {
+                    logger.warn("Can't extend lock {}", lockConfiguration.getName());
+                    stop();
                 }
             }
         }
 
-        private Duration getLockExtensionPeriod() {
-            return lockExtensionPeriod;
-        }
-
-        private SimpleLock getLock() {
-            return lock;
-        }
-
-        private void setFuture(ScheduledFuture<?> future) {
-            this.future = future;
-        }
-    }
-
-    private static class SimpleLockWrapper implements SimpleLock {
-        private final LockExtender lockExtender;
-        private final ScheduledFuture<?> future;
-
-        private SimpleLockWrapper(LockExtender lockExtender, ScheduledFuture<?> future) {
-            this.lockExtender = lockExtender;
-            this.future = future;
-        }
-
-        @Override
-        public void unlock() {
+        private void stop() {
             future.cancel(false);
-            getLock().unlock();
         }
 
         @Override
-        @NonNull
-        public Optional<SimpleLock> extend(@NonNull Instant lockAtMostUntil, @NonNull Instant lockAtLeastUntil) {
-            return getLock().extend(lockAtMostUntil, lockAtLeastUntil);
+        protected void doUnlock() {
+            stop();
+            synchronized (this) {
+                lock.unlock();
+                unlocked = true;
+            }
         }
 
         @Override
-        @NonNull
-        public Optional<SimpleLock> extend(@NonNull Duration lockAtMostFor, @NonNull Duration lockAtLeastFor) {
-            return getLock().extend(lockAtMostFor, lockAtLeastFor);
-        }
-
-        private SimpleLock getLock() {
-            return lockExtender.getLock();
+        protected Optional<SimpleLock> doExtend(LockConfiguration newConfiguration) {
+            throw new UnsupportedOperationException("Manual extension of KeepAliveLock is not supported (yet)");
         }
     }
 }
